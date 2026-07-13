@@ -44,24 +44,55 @@ def get_client() -> AsyncGroq:
 # Chat (streaming)
 # ---------------------------------------------------------------------------
 
-def build_system_prompt(site_url: str, policies: dict, product_count: int) -> str:
+def _format_price(price, currency: str | None) -> str:
+    if price is None:
+        return "price not listed"
+    symbol = {"INR": "₹", "USD": "$", "GBP": "£", "EUR": "€"}.get(currency or "", "")
+    return f"{symbol}{price:,.0f}" if symbol else f"{price:,.0f} {currency or ''}".strip()
+
+
+def build_system_prompt(
+    site_url: str,
+    policies: dict,
+    product_count: int,
+    relevant_products: list | None = None,
+) -> str:
     policy_context = "\n".join(
         f"{name.replace('_', ' ').title()}: {text[:1500]}"
         for name, text in policies.items() if text
     ) or "No policy information was found for this site."
 
+    if relevant_products:
+        lines = []
+        for p in relevant_products:
+            price = _format_price(p.get("price"), p.get("currency"))
+            lines.append(f"- {p.get('title')} — {price} — {p.get('product_url')}")
+        catalogue_context = (
+            "These are the products from this site most relevant to the user's question "
+            "(already filtered and ranked for you):\n" + "\n".join(lines)
+        )
+    else:
+        catalogue_context = (
+            "No products in this catalogue matched the user's question. Say so honestly "
+            "rather than inventing items."
+        )
+
     return f"""You are a helpful shopping assistant for the jewellery website {site_url}.
 You ONLY answer questions about this specific website — its products, policies, and shopping experience.
-The site has {product_count} products in the current catalog.
+The site has {product_count} products in the catalogue.
+
+{catalogue_context}
 
 Here is the policy information scraped from this site:
 {policy_context}
 
 Rules:
-- Answer policy questions (returns, shipping, etc.) using ONLY the policy information above. If something isn't covered, say you don't have that information and suggest the user check the site directly.
-- Keep answers concise and friendly, like a helpful store assistant.
-- If asked for product recommendations, mention that the user can use the image upload or the guided filter (occasion/price/material/type) for the best matches.
-- Do not make up information about products or policies that isn't provided to you.
+- Recommend products ONLY from the list above. Never invent a product, price, or link.
+- When recommending, name the product, give its price, and include its link as a markdown link.
+- Recommend at most 5 products unless asked for more. Lead with the best fit and say why in a few words.
+- If the list above is empty or nothing fits, say plainly that you couldn't find a match on this site, and suggest relaxing the budget or trying a different style.
+- Answer policy questions (returns, shipping, etc.) using ONLY the policy information above. If it isn't covered, say you don't have that information and point the user to the site.
+- Keep answers concise and warm, like a good store assistant. No preamble.
 """
 
 

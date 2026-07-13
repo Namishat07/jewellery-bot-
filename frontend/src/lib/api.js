@@ -24,14 +24,24 @@ export async function createSession(url) {
  * Streams a chat response. Calls onChunk(text) for each token as it
  * arrives, and onDone() once the stream finishes.
  */
+export class SessionExpiredError extends Error {
+  constructor() {
+    super('This session expired (the server restarted). Re-scanning the site…')
+    this.name = 'SessionExpiredError'
+  }
+}
+
 export async function streamChat(sessionId, message, onChunk, onDone) {
   const res = await fetch(`${BASE}/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ session_id: sessionId, message }),
   })
+  // The backend drops in-memory sessions on restart and after 1h idle. That is a
+  // 404, not an unreachable backend — say so, so it can be recovered from.
+  if (res.status === 404) throw new SessionExpiredError()
   if (!res.ok || !res.body) {
-    throw new Error('Chat request failed.')
+    throw new Error(`Chat request failed (${res.status}).`)
   }
 
   const reader = res.body.getReader()
@@ -49,6 +59,9 @@ export async function streamChat(sessionId, message, onChunk, onDone) {
     for (const part of parts) {
       if (part.startsWith('event: done')) {
         onDone?.()
+      } else if (part.startsWith('event: error')) {
+        const detail = part.split('data: ')[1] || 'The assistant backend failed.'
+        throw new Error(detail)
       } else if (part.startsWith('data: ')) {
         onChunk(part.slice(6))
       }
@@ -72,6 +85,10 @@ export async function imageSearch(sessionId, file) {
   formData.append('session_id', sessionId)
   formData.append('image', file)
   const res = await fetch(`${BASE}/image-search`, { method: 'POST', body: formData })
-  if (!res.ok) throw new Error('Image search failed.')
+  if (res.status === 404) throw new SessionExpiredError()
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.detail || `Image search failed (${res.status}).`)
+  }
   return res.json()
 }

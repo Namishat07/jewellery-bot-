@@ -1,0 +1,27 @@
+# Secrets must never enter the image — inject GROQ_API_KEY at runtime instead.
+.env
+*.env
+!.env.example
+
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+Backend/.venv/
+Backend/__pycache__/
+Backend/*.ipynb
+
+# Node — reinstalled inside the build stage
+node_modules/
+frontend/node_modules/
+
+# Stale build output; stage 1 regenerates it
+Backend/static/
+
+.DS_Store
+.vscode/
+.idea/
