@@ -14,6 +14,26 @@ Two entry points:
 
 import re
 
+# ---------------------------------------------------------------------------
+# Whole-word matching helpers
+# ---------------------------------------------------------------------------
+# Plain substring checks (e.g. `"ring" in text`) false-positive badly for
+# jewellery: "ring" is a substring of "earring"/"earrings", so filtering by
+# "ring" was also returning earrings and pendants. Tokenizing into whole
+# words and normalizing simple plurals (rings -> ring, earrings -> earring)
+# fixes this without needing a stemming library.
+
+def _normalize_token(word: str) -> str:
+    word = word.lower().strip()
+    if word.endswith("s") and len(word) > 3:
+        word = word[:-1]
+    return word
+
+
+def _tokenize(text: str) -> set:
+    return {_normalize_token(w) for w in re.findall(r"[a-zA-Z]+", text or "")}
+
+
 OCCASION_KEYWORDS = {
     "wedding": ["wedding", "bridal", "bride", "marriage"],
     "engagement": ["engagement", "proposal", "solitaire"],
@@ -43,18 +63,41 @@ def filter_products(
         results = [p for p in results if p.get("price") is not None and p["price"] <= max_price]
 
     if material:
-        material_lower = material.lower()
+        material_norm = _normalize_token(material)
         results = [
             p for p in results
-            if material_lower in (p.get("title", "") + " " + p.get("description", "")).lower()
+            if material_norm in _tokenize(p.get("title", "") + " " + p.get("description", ""))
         ]
 
     if jewellery_type:
-        type_lower = jewellery_type.lower()
-        results = [
-            p for p in results
-            if type_lower in (p.get("title", "") + " " + p.get("description", "")).lower()
-        ]
+        type_norm = _normalize_token(jewellery_type)
+
+        def _matches_type(p: dict) -> bool:
+            # Prefer the site's own category field when the scraper found one
+            # (e.g. Shopify "product_type": "Rings") — the most reliable
+            # signal, and it sidesteps free-text matching entirely.
+            ptype = p.get("product_type") or ""
+            if ptype and type_norm in _tokenize(ptype):
+                return True
+
+            # Explicit tags are also pre-categorized and reliable.
+            tags = p.get("tags") or []
+            if any(_normalize_token(t) == type_norm for t in tags):
+                return True
+
+            # Fall back to whole-word matching on the title only, when no
+            # structured category/tag data exists for this product. Title-
+            # only (not description) avoids false positives from prose that
+            # happens to mention the word incidentally (e.g. a pendant
+            # described as having a "ring-shaped clasp"). Whole-word matching
+            # (not substring) is what stops "ring" from also matching inside
+            # "earring" / "earrings".
+            if not ptype and not tags:
+                return type_norm in _tokenize(p.get("title", ""))
+
+            return False
+
+        results = [p for p in results if _matches_type(p)]
 
     if occasion:
         keywords = OCCASION_KEYWORDS.get(occasion.lower(), [occasion.lower()])
