@@ -1,0 +1,59 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    @apply border-hairline;
+  }
+  body {
+    @apply bg-ink text-ivory font-sans antialiased;
+  }
+  :focus-visible {
+    outline: 2px solid #C9A659;
+    outline-offset: 2px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Facet glow — the signature element. A slow-rotating conic gradient,
+   like light catching the facets of a cut gemstone, sitting behind the
+   URL input on the landing screen. */
+.facet-glow {
+  position: absolute;
+  inset: -40%;
+  background: conic-gradient(
+    from 0deg,
+    #C9A659 0deg,
+    transparent 60deg,
+    #7A2E2E 140deg,
+    transparent 200deg,
+    #E0C280 280deg,
+    transparent 340deg
+  );
+  filter: blur(60px);
+  opacity: 0.35;
+  animation: facetGlow 14s linear infinite;
+  pointer-events: none;
+}
+
+/* Hallmark stamp — small circular badge marking assistant messages,
+   referencing a jeweller's assay hallmark. */
+.hallmark {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 1px solid #C9A659;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  background: #211C15;
+}
