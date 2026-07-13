@@ -90,11 +90,36 @@ REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=25)
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 MAX_ATTEMPTS = 3
 INITIAL_BACKOFF_SECONDS = 1.0
+
 USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
-HEADERS = {"User-Agent": USER_AGENT}
+
+# Sending a User-Agent and nothing else is itself a bot signal: real Chrome always
+# sends Accept, Accept-Language and the Sec-Fetch-* set. Cloudflare/Shopify weight
+# that header fingerprint heavily, and they are far stricter with datacentre IPs
+# (Render/AWS/GCP) than with home broadband -- which is exactly why giva.co returns
+# products locally but 403s from Render.
+HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    # Deliberately NOT setting Accept-Encoding: aiohttp advertises exactly the codecs
+    # it can actually decode. Claiming "br" here makes servers send Brotli, which
+    # aiohttp cannot decompress without the optional brotli package -- every response
+    # then dies with ClientResponseError.
+    "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"macOS"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "Cache-Control": "max-age=0",
+    "Connection": "keep-alive",
+}
 
 # Python builds from python.org (and slim Docker images) ship without a CA bundle
 # wired into ssl's default context, so every HTTPS handshake fails with
