@@ -105,59 +105,42 @@ class FilterRequest(BaseModel):
 # Session lifecycle
 # ---------------------------------------------------------------------------
 
-def _map_failure_reason(reason: str) -> tuple[int, str]:
-    messages = {
-        "blocked": (403, "This site blocks automated access, so its catalogue can't be read."),
-        "throttled": (503, "This site is rate-limiting us right now. Wait a minute and try again."),
-        "no_products": (422, "Couldn't find any products on this site. It may use a catalogue "
-                             "structure this scraper doesn't recognise yet."),
-    }
-    return messages.get(reason, (422, f"Couldn't read this site ({reason})."))
-
-
-async def _run_scrape(session_id: str, url: str) -> None:
-    """
-    Runs in the background, decoupled from the HTTP request that created the
-    session. This is what lets POST /api/session respond in milliseconds
-    regardless of how long the actual scrape takes (up to
-    DEFAULT_TIMEOUT_SECONDS) -- no request stays open long enough to hit a
-    hosting platform's own proxy/gateway timeout.
-    """
-    try:
-        result = await scrape_site(url)
-    except Exception:
-        log.exception("scrape crashed for %s", url)
-        store.mark_failed(session_id, 500, "The scraper crashed unexpectedly. Check server logs.")
-        return
-
-    if not result["products"]:
-        reason = result["meta"].get("failure_reason", "no_products")
-        status, detail = _map_failure_reason(reason)
-        log.warning("scrape failed for %s: %s", url, reason)
-        store.mark_failed(session_id, status, detail)
-        return
-
-    store.mark_ready(
-        session_id,
-        products=result["products"],
-        policies=result["policies"],
-        meta=result["meta"],
-    )
-    log.info("scrape ready for %s: %d products", url, len(result["products"]))
-
-
-@app.post("/api/session", status_code=202)
+@app.post("/api/session")
 async def create_session(req: CreateSessionRequest):
     if not req.url or not req.url.strip():
         raise HTTPException(status_code=400, detail="URL is required")
 
-    session = store.create_pending(site_url=req.url)
-    asyncio.create_task(_run_scrape(session.session_id, req.url))
+    result = await scrape_site(req.url)
 
-    # Responds immediately -- scraping continues in the background. The
-    # frontend should poll GET /api/session/{session_id} every couple of
-    # seconds until status is "ready" or "failed".
-    return {"session_id": session.session_id, "status": session.status}
+    if not result["products"]:
+        reason = result["meta"].get("failure_reason", "no_products")
+        messages = {
+            "blocked": (403, "This site blocks automated access, so its catalogue can't be read."),
+            "throttled": (503, "This site is rate-limiting us right now. Wait a minute and try again."),
+            "no_products": (422, "Couldn't find any products on this site. It may use a catalogue "
+                                 "structure this scraper doesn't recognise yet."),
+        }
+        status, detail = messages.get(
+            reason, (422, f"Couldn't read this site ({reason}).")
+        )
+        log.warning("scrape failed for %s: %s", req.url, reason)
+        raise HTTPException(status_code=status, detail=detail)
+
+    session = store.create(
+        site_url=result["site_url"],
+        products=result["products"],
+        policies=result["policies"],
+        meta=result["meta"],
+    )
+
+    return {
+        "session_id": session.session_id,
+        "site_url": session.site_url,
+        "product_count": len(session.products),
+        "scrape_method": session.meta["method"],
+        "elapsed_seconds": session.meta["elapsed_seconds"],
+        "filter_options": get_available_filter_options(session.products),
+    }
 
 
 @app.get("/api/session/{session_id}")
@@ -165,43 +148,12 @@ async def get_session(session_id: str):
     session = store.get(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found or expired")
-
-    if session.status == "scraping":
-        return {"session_id": session.session_id, "status": "scraping"}
-
-    if session.status == "failed":
-        return {
-            "session_id": session.session_id,
-            "status": "failed",
-            "error": {"status_code": session.error_status_code, "detail": session.error_detail},
-        }
-
     return {
         "session_id": session.session_id,
-        "status": "ready",
         "site_url": session.site_url,
         "product_count": len(session.products),
-        "scrape_method": session.meta.get("method"),
-        "elapsed_seconds": session.meta.get("elapsed_seconds"),
         "filter_options": get_available_filter_options(session.products),
     }
-
-
-def _get_ready_session(session_id: str):
-    """Fetch a session and make sure scraping has actually finished before any
-    endpoint that reads session.products touches it -- otherwise a request
-    that lands mid-scrape would silently run against an empty/partial list."""
-    session = store.get(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found or expired")
-    if session.status == "scraping":
-        raise HTTPException(status_code=409, detail="This site is still being scraped. Try again shortly.")
-    if session.status == "failed":
-        raise HTTPException(
-            status_code=session.error_status_code or 422,
-            detail=session.error_detail or "Scraping this site failed.",
-        )
-    return session
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +162,9 @@ def _get_ready_session(session_id: str):
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
-    session = _get_ready_session(req.session_id)
+    session = store.get(req.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
 
     # Ground the answer in the actual catalogue: retrieve the products relevant to
     # this question and put them in the prompt. The full catalogue can be thousands
@@ -250,7 +204,9 @@ async def chat(req: ChatRequest):
 
 @app.post("/api/image-search")
 async def image_search(session_id: str = Form(...), image: UploadFile = File(...)):
-    session = _get_ready_session(session_id)
+    session = store.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
 
     image_bytes = await image.read()
     if len(image_bytes) > 10 * 1024 * 1024:
@@ -268,7 +224,9 @@ async def image_search(session_id: str = Form(...), image: UploadFile = File(...
 
 @app.post("/api/filter")
 async def filter_endpoint(req: FilterRequest):
-    session = _get_ready_session(req.session_id)
+    session = store.get(req.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
 
     matches = filter_products(
         session.products,
