@@ -80,7 +80,13 @@ SHOPIFY_PAGE_SIZE = 250               # Shopify's hard max for /products.json
 SHOPIFY_PAGES_IN_FLIGHT = 5           # fetch this many catalogue pages concurrently
 MAX_CONCURRENT_REQUESTS = 8
 MAX_CONCURRENT_BROWSER_PAGES = 4
-MIN_PRODUCTS_FOR_SUCCESS = 5          # below this, tier 3 (browser) kicks in
+MIN_PRODUCTS_FOR_SUCCESS = 40         # below this, tier 4 (browser) kicks in. Was 5 --
+                                       # too low to trigger on JS-only sites that
+                                       # partially scrape via static tiers (e.g. a few
+                                       # dozen products from homepage links); tier 4
+                                       # only overwrites results if it finds MORE
+                                       # products, so raising this is low-risk even for
+                                       # genuinely small catalogues.
 MAX_COLLECTION_PAGES_TO_CRAWL = 6     # tier 2 depth-2 crawl cap
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=25)
 
@@ -145,8 +151,14 @@ COLLECTION_LINK_HINTS = ["/collections", "/collection", "/category", "/categorie
 # on BlueStone), so hardcoded path hints will never generalise. Sitemaps are a web
 # standard every serious storefront publishes, so we read those instead of guessing.
 SITEMAP_FALLBACK_PATHS = ["/sitemap.xml", "/sitemap_index.xml", "/sitemap-index.xml"]
-MAX_SITEMAP_PRODUCTS = 400            # product pages we're willing to fetch one-by-one
-MAX_CHILD_SITEMAPS = 8
+MAX_SITEMAP_PRODUCTS = 2000            # product pages we're willing to fetch one-by-one.
+                                        # Was 400 -- large non-Shopify catalogues were
+                                        # being truncated well below their real size.
+                                        # Still bounded by the wall-clock deadline below,
+                                        # so slow sites can't run away with this.
+MAX_CHILD_SITEMAPS = 30                # was 8 -- many storefronts split products across
+                                        # dozens of sitemap-products-N.xml files; 8 missed
+                                        # most of the catalogue on sites like that.
 MAX_SITEMAP_DEPTH = 2
 MAX_CONCURRENT_PDP_FETCHES = 24
 
@@ -300,6 +312,7 @@ async def _try_shopify(base_url: str, session: aiohttp.ClientSession) -> dict | 
     products: list = []
     next_page = 1
     exhausted = False
+    consecutive_failed_batches = 0
 
     while not exhausted and len(products) < MAX_PRODUCTS:
         page_numbers = range(next_page, next_page + SHOPIFY_PAGES_IN_FLIGHT)
@@ -308,9 +321,24 @@ async def _try_shopify(base_url: str, session: aiohttp.ClientSession) -> dict | 
             for n in page_numbers
         ])
 
+        batch_had_any_response = False
         for data in batches:
+            if data is None:
+                # _get() already retried this page internally and still failed
+                # (throttled/blocked/timed out). That is NOT proof the catalogue
+                # ended -- it's proof of a bad request. Treating it as "no more
+                # products" is what truncated bigger, more heavily-protected
+                # stores (e.g. Mejuri) down to whatever loaded before the first
+                # hiccup. Skip this page and keep going; the other pages in this
+                # batch, and the next batch, may still succeed.
+                log.info("shopify: a page fetch failed for %s, skipping (not treated as end-of-catalogue)", base_url)
+                continue
+
+            batch_had_any_response = True
             batch = data.get("products", []) if isinstance(data, dict) else []
             if not batch:
+                # A real HTTP 200 with an empty products list -- this genuinely
+                # is the end of the catalogue.
                 exhausted = True
                 break
 
@@ -318,6 +346,20 @@ async def _try_shopify(base_url: str, session: aiohttp.ClientSession) -> dict | 
 
             if len(batch) < SHOPIFY_PAGE_SIZE:   # short page == last page
                 exhausted = True
+                break
+
+        if batch_had_any_response:
+            consecutive_failed_batches = 0
+        else:
+            # Every page in this batch failed. Could be a fully-blocked site --
+            # give up after a few consecutive whole-batch failures rather than
+            # looping until the outer timeout kills us.
+            consecutive_failed_batches += 1
+            if consecutive_failed_batches >= 3:
+                log.warning(
+                    "shopify: %d consecutive failed batches for %s, giving up",
+                    consecutive_failed_batches, base_url,
+                )
                 break
 
         next_page += SHOPIFY_PAGES_IN_FLIGHT
