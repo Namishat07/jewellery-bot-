@@ -53,7 +53,7 @@ from matching import (
 
 async def _cleanup_loop():
     while True:
-        await asyncio.sleep(600)  # every 10 minutes
+        await asyncio.sleep(60)  # was 600 — now check every 1 minute
         store.cleanup_expired()
 
 

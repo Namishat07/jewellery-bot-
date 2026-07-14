@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from threading import Lock
 
 
-SESSION_TTL_SECONDS = 60 * 60  # 1 hour of inactivity -> session dropped
+SESSION_TTL_SECONDS = 60 * 5  # was 60 * 60 — now 5 minutes of inactivity
 
 
 @dataclass
