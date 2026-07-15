@@ -59,6 +59,7 @@ Colab setup:
 import asyncio
 import json
 import logging
+import random
 import re
 import ssl
 import time
@@ -74,11 +75,14 @@ log = logging.getLogger(__name__)
 # Config
 # ---------------------------------------------------------------------------
 
-DEFAULT_TIMEOUT_SECONDS = 150
+DEFAULT_TIMEOUT_SECONDS = 210          # was 150 -- 403 backoff + lower concurrency below
+                                        # made every tier slower on purpose, so the
+                                        # overall budget needs to grow to match.
 MAX_PRODUCTS = 5000
 SHOPIFY_PAGE_SIZE = 250               # Shopify's hard max for /products.json
 SHOPIFY_PAGES_IN_FLIGHT = 5           # fetch this many catalogue pages concurrently
-MAX_CONCURRENT_REQUESTS = 8
+MAX_CONCURRENT_REQUESTS = 4            # was 8 -- less aggressive so bot-protected
+                                        # storefronts (403s) don't get hammered
 MAX_CONCURRENT_BROWSER_PAGES = 4
 MIN_PRODUCTS_FOR_SUCCESS = 40         # below this, tier 4 (browser) kicks in. Was 5 --
                                        # too low to trigger on JS-only sites that
@@ -93,9 +97,12 @@ REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=25)
 # Storefronts behind Shopify/Cloudflare bot protection throttle bursts of requests
 # with a 5xx or 429 rather than a hard block, and recover within seconds. Treating
 # those as "this site has no products" is wrong -- back off and retry instead.
-RETRY_STATUSES = {429, 500, 502, 503, 504}
+RETRY_STATUSES = {403, 429, 500, 502, 503, 504}
 MAX_ATTEMPTS = 3
 INITIAL_BACKOFF_SECONDS = 1.0
+FORBIDDEN_BACKOFF_SECONDS = 4.0        # 403s are usually bot-protection throttling,
+                                        # not a hard block -- worth a longer, distinct
+                                        # backoff before retrying rather than giving up
 
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -160,7 +167,8 @@ MAX_CHILD_SITEMAPS = 30                # was 8 -- many storefronts split product
                                         # dozens of sitemap-products-N.xml files; 8 missed
                                         # most of the catalogue on sites like that.
 MAX_SITEMAP_DEPTH = 2
-MAX_CONCURRENT_PDP_FETCHES = 24
+MAX_CONCURRENT_PDP_FETCHES = 10        # was 24 -- less aggressive so bot-protected
+                                        # storefronts (403s) don't get hammered
 
 # Pages that live in a sitemap but are definitely not products.
 NON_PRODUCT_URL_HINTS = [
@@ -215,7 +223,7 @@ async def scrape_site(url: str, timeout: int = DEFAULT_TIMEOUT_SECONDS) -> dict:
         # ---- Tier 2: sitemap crawl (the universal path for non-Shopify stores) ----
         if not products:
             method = "sitemap"
-            deadline = start + timeout * 0.55
+            deadline = start + timeout * 0.70
             try:
                 # Deadline-aware internally, so it returns partial results rather than
                 # being cancelled empty-handed. The wait_for is only a backstop.
@@ -232,7 +240,8 @@ async def scrape_site(url: str, timeout: int = DEFAULT_TIMEOUT_SECONDS) -> dict:
         if not products:
             method = "html_fallback"
             elapsed = time.time() - start
-            remaining = max(10, timeout * 0.65 - elapsed)
+            remaining = max(10, timeout * 0.85 - elapsed)   # was 0.65 -- must exceed
+                                                             # tier 2's 0.70 deadline share
             try:
                 html_result = await asyncio.wait_for(
                     _html_fallback_scrape(url, session), timeout=remaining
@@ -430,7 +439,7 @@ async def _sitemap_scrape(base_url: str, session: aiohttp.ClientSession, deadlin
             break
         chunk = product_urls[i:i + chunk_size]
         parsed = await asyncio.gather(
-            *[_fetch_and_parse_product(session, u, sem, strict=True) for u in chunk],
+            *[_fetch_and_parse_product(session, u, sem, strict=False) for u in chunk],
             return_exceptions=True,
         )
         products.extend(p for p in parsed if isinstance(p, dict) and p)
@@ -519,8 +528,14 @@ async def _html_fallback_scrape(base_url: str, session: aiohttp.ClientSession) -
     soup = _soup(homepage_html)
     all_links = _extract_links(soup, base_url)
 
-    direct_product_links = {l for l in all_links if any(h in l.lower() for h in PRODUCT_LINK_HINTS)}
+    candidate_links = set(_filter_product_urls(list(all_links), base_url))
+    direct_product_links = {l for l in candidate_links if any(h in l.lower() for h in PRODUCT_LINK_HINTS)}
     collection_links = list({l for l in all_links if any(h in l.lower() for h in COLLECTION_LINK_HINTS)})[:MAX_COLLECTION_PAGES_TO_CRAWL]
+    # fall back to every non-excluded link as a candidate if the narrow hint list
+    # found nothing -- non-English product URL schemes (e.g. Kalyan) don't contain
+    # any of PRODUCT_LINK_HINTS, so the narrow check alone returns an empty set.
+    if not direct_product_links:
+        direct_product_links = candidate_links
 
     sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
@@ -533,8 +548,13 @@ async def _html_fallback_scrape(base_url: str, session: aiohttp.ClientSession) -
         if isinstance(html, str):
             csoup = _soup(html)
             clinks = _extract_links(csoup, base_url)
-            direct_product_links |= {l for l in clinks if any(h in l.lower() for h in PRODUCT_LINK_HINTS)}
+            c_candidates = set(_filter_product_urls(list(clinks), base_url))
+            c_direct = {l for l in c_candidates if any(h in l.lower() for h in PRODUCT_LINK_HINTS)}
+            direct_product_links |= c_direct if c_direct else c_candidates
 
+    # cap what actually gets fetched-and-parsed -- this fallback set can be much
+    # bigger and noisier, so this is the real safety net against garbage links
+    # (nav menus etc.) wasting request budget.
     product_links = list(direct_product_links)[:MAX_PRODUCTS]
     policy_links = _classify_policy_links(all_links)
 
@@ -585,8 +605,6 @@ def _parse_product_html(html: str, url: str, strict: bool = False) -> dict | Non
     description = _meta_content(soup, "og:description") or ""
 
     if not title:
-        return None
-    if strict and price is None:
         return None
 
     return {
@@ -670,8 +688,13 @@ async def _browser_fallback_scrape(base_url: str) -> dict:
 
             soup = _soup(homepage_html)
             all_links = _extract_links(soup, base_url)
-            direct_product_links = {l for l in all_links if any(h in l.lower() for h in PRODUCT_LINK_HINTS)}
+            candidate_links = set(_filter_product_urls(list(all_links), base_url))
+            direct_product_links = {l for l in candidate_links if any(h in l.lower() for h in PRODUCT_LINK_HINTS)}
             collection_links = list({l for l in all_links if any(h in l.lower() for h in COLLECTION_LINK_HINTS)})[:MAX_COLLECTION_PAGES_TO_CRAWL]
+            # fall back to every non-excluded link if the narrow hint list found
+            # nothing -- see the matching comment in _html_fallback_scrape.
+            if not direct_product_links:
+                direct_product_links = candidate_links
             policy_links = _classify_policy_links(all_links)
 
             sem = asyncio.Semaphore(MAX_CONCURRENT_BROWSER_PAGES)
@@ -685,8 +708,12 @@ async def _browser_fallback_scrape(base_url: str) -> dict:
                 if isinstance(html, str):
                     csoup = _soup(html)
                     clinks = _extract_links(csoup, base_url)
-                    direct_product_links |= {l for l in clinks if any(h in l.lower() for h in PRODUCT_LINK_HINTS)}
+                    c_candidates = set(_filter_product_urls(list(clinks), base_url))
+                    c_direct = {l for l in c_candidates if any(h in l.lower() for h in PRODUCT_LINK_HINTS)}
+                    direct_product_links |= c_direct if c_direct else c_candidates
 
+            # cap what actually gets rendered -- real safety net against garbage
+            # links (nav menus etc.) wasting request/render budget.
             product_links = list(direct_product_links)[:MAX_PRODUCTS]
 
             product_htmls = await asyncio.gather(
@@ -777,8 +804,9 @@ async def _get(session: aiohttp.ClientSession, url: str, as_json: bool = False):
         try:
             async with session.get(url) as resp:
                 if resp.status in RETRY_STATUSES and attempt < MAX_ATTEMPTS:
-                    log.info("%s -> HTTP %s, retrying in %.1fs", url, resp.status, backoff)
-                    await asyncio.sleep(backoff)
+                    wait = FORBIDDEN_BACKOFF_SECONDS if resp.status == 403 else backoff
+                    log.info("%s -> HTTP %s, retrying in %.1fs", url, resp.status, wait)
+                    await asyncio.sleep(wait)
                     backoff *= 2
                     continue
                 if resp.status != 200:
@@ -801,6 +829,7 @@ async def _fetch_text(session: aiohttp.ClientSession, url: str) -> str | None:
 
 async def _fetch_text_bounded(session: aiohttp.ClientSession, url: str, sem: asyncio.Semaphore) -> str | None:
     async with sem:
+        await asyncio.sleep(random.uniform(0.2, 0.6))
         return await _fetch_text(session, url)
 
 
