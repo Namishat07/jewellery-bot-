@@ -113,7 +113,7 @@ export default function FilterFlow({ sessionId, onComplete }) {
             <p className="text-xs text-muted flex items-center gap-1.5 mb-1">
               <Check size={12} className="text-brass" /> Matched on your preferences
             </p>
-            <ProductGrid products={results} />
+            <ProductGrid products={results} sessionId={sessionId} />
           </div>
         )}
       </div>

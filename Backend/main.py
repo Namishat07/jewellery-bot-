@@ -7,6 +7,8 @@ FastAPI backend for the jewellery chatbot. Serves:
   - POST /api/chat             -> SSE streaming chat response
   - POST /api/image-search     -> upload an image, get matched products
   - POST /api/filter           -> MCQ-style guided filter
+  - POST /api/tryon/prepare    -> background-remove + cache a product photo for try-on
+  - GET  /api/tryon/asset/...  -> serve the cached try-on cutout
   - (in production) serves the built React frontend as static files
 
 Run locally:
@@ -26,7 +28,7 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -45,6 +47,7 @@ from matching import (
     get_available_filter_options,
     search_products,
 )
+from tryon import prepare_asset, get_cached_path
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +102,11 @@ class FilterRequest(BaseModel):
     max_price: float | None = None
     material: str | None = None
     jewellery_type: str | None = None
+
+
+class TryOnPrepareRequest(BaseModel):
+    session_id: str
+    product_id: str
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +245,46 @@ async def filter_endpoint(req: FilterRequest):
         jewellery_type=req.jewellery_type,
     )
     return {"matches": matches}
+
+
+# ---------------------------------------------------------------------------
+# Try-on (background-removed cutout, cached per product)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/tryon/prepare")
+async def tryon_prepare(req: TryOnPrepareRequest):
+    """Call this once when the user taps 'Try on' for a product. Downloads the
+    scraped photo, removes its background, and caches the cutout. Idempotent —
+    safe to call again, it's a no-op if already cached."""
+    session = store.get(req.session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
+
+    product = next((p for p in session.products if str(p.get("id")) == req.product_id), None)
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found in this session")
+
+    result = await prepare_asset(req.session_id, product)
+    if not result["ready"]:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Could not prepare a try-on asset for this product ({result.get('reason')})",
+        )
+
+    return {
+        "anchor_type": result["anchor_type"],
+        "asset_url": f"/api/tryon/asset/{req.session_id}/{req.product_id}",
+    }
+
+
+@app.get("/api/tryon/asset/{session_id}/{product_id}")
+async def tryon_asset(session_id: str, product_id: str):
+    """Serves the cached, background-removed cutout PNG for a product.
+    Call /api/tryon/prepare first — this 404s if that hasn't run yet."""
+    path = get_cached_path(session_id, product_id)
+    if not path:
+        raise HTTPException(status_code=404, detail="Asset not prepared yet — call /api/tryon/prepare first")
+    return FileResponse(path, media_type="image/png")
 
 
 @app.get("/api/health")

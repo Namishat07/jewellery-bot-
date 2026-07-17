@@ -2,7 +2,7 @@ import { motion } from 'framer-motion'
 import { Gem, User } from 'lucide-react'
 import ProductGrid from './ProductGrid'
 
-export default function MessageBubble({ message }) {
+export default function MessageBubble({ message, sessionId }) {
   const isUser = message.role === 'user'
 
   return (
@@ -36,7 +36,7 @@ export default function MessageBubble({ message }) {
 
         {message.products && (
           <div className="w-full mt-1">
-            <ProductGrid products={message.products} />
+            <ProductGrid products={message.products} sessionId={sessionId} />
           </div>
         )}
       </div>

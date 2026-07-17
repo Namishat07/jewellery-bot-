@@ -9,3 +9,7 @@ playwright>=1.44
 groq>=0.9
 pydantic>=2.0
 python-dotenv>=1.0
+
+# --- Try-on feature ---
+rembg>=2.0.57
+Pillow>=10.0

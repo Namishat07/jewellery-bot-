@@ -3,7 +3,7 @@ import { motion } from 'framer-motion'
 import { Send, ImagePlus, SlidersHorizontal, Gem } from 'lucide-react'
 import { streamChat } from '../lib/api'
 import MessageBubble from './MessageBubble'
-import FilterFlow from './FilterFlow'
+import FilterFlow from '../../FilterFlow'
 import ImageUploadBubble from './ImageUploadBubble'
 
 let idCounter = 0
@@ -93,7 +93,7 @@ export default function ChatView({ session }) {
 
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-5 py-6 space-y-5 max-w-3xl w-full mx-auto">
         {items.map((item) => {
-          if (item.kind === 'message') return <MessageBubble key={item.id} message={item} />
+          if (item.kind === 'message') return <MessageBubble key={item.id} message={item} sessionId={session.session_id} />
           if (item.kind === 'filter') return <FilterFlow key={item.id} sessionId={session.session_id} />
           if (item.kind === 'image-upload') return <ImageUploadBubble key={item.id} sessionId={session.session_id} />
           return null

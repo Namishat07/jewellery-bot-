@@ -83,7 +83,7 @@ export default function ImageUploadBubble({ sessionId }) {
             {results && (
               <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
                 <p className="text-xs text-muted mb-1">Closest matches from the catalogue:</p>
-                <ProductGrid products={results} />
+                <ProductGrid products={results} sessionId={sessionId} />
               </motion.div>
             )}
           </div>
